@@ -4,6 +4,84 @@
 */
 import { GoogleGenAI, GenerateContentResponse, Modality } from "@google/genai";
 
+// Module-level variable to hold the initialized fal client instance.
+// We use `any` as we're dynamically importing the type.
+let falClient: any = null;
+
+/**
+ * Dynamically imports and initializes the Fal AI client on first use.
+ * This avoids a crash on load if `process.env` is not defined in the browser.
+ * @returns {Promise<any>} The initialized fal client instance.
+ */
+const getFalClient = async () => {
+    if (!falClient) {
+        // Dynamically import the fal client library.
+        const { fal } = await import('@fal-ai/client');
+        // Configure it with credentials from environment variables.
+        fal.config({
+            credentials: process.env.FAL_KEY,
+        });
+        falClient = fal;
+    }
+    return falClient;
+};
+
+// Helper for Fal AI image editing fallback
+const falImageEditFallback = async (prompt: string, images: File[], context: string): Promise<string> => {
+    try {
+        const fal = await getFalClient();
+        console.log(`Calling Fal AI for ${context} with prompt: ${prompt}`);
+        // The fal client can take File objects directly and will handle uploads.
+        const result: { images: { url: string }[] } = await fal.subscribe("fal-ai/nano-banana/edit", {
+            input: {
+                prompt: prompt,
+                image_urls: images,
+                output_format: "png",
+                sync_mode: true, // This makes the URL a data URI
+                num_images: 1,
+            },
+        });
+        
+        if (!result.images || result.images.length === 0) {
+            throw new Error("Fal AI fallback did not return an image.");
+        }
+        
+        console.log(`Fal AI fallback for ${context} successful.`);
+        return result.images[0].url;
+
+    } catch (falError) {
+        console.error(`Fal AI fallback request for ${context} failed.`, falError);
+        // Re-throw to be caught by the calling function's outer catch block.
+        throw falError;
+    }
+};
+
+// Helper for Fal AI text-to-image fallback
+const falTextToImageFallback = async (userPrompt: string): Promise<string> => {
+    try {
+        const fal = await getFalClient();
+        console.log(`Calling Fal AI for text-to-image fallback with prompt: ${userPrompt}`);
+        const result: { images: { url: string }[] } = await fal.subscribe("fal-ai/nano-banana", {
+            input: {
+                prompt: userPrompt,
+                output_format: "png",
+                sync_mode: true,
+                num_images: 1,
+            },
+        });
+
+        if (!result.images || result.images.length === 0) {
+            throw new Error("Fal AI fallback did not return an image.");
+        }
+        console.log("Fal AI text-to-image fallback successful.");
+        return result.images[0].url; // This will be a data URI
+    } catch (falError) {
+        console.error(`Fal AI text-to-image fallback request failed.`, falError);
+        throw falError;
+    }
+};
+
+
 // Helper function to get image dimensions from a File object
 const getImageDimensions = (file: File): Promise<{ width: number; height: number; }> => {
     return new Promise((resolve, reject) => {
@@ -90,29 +168,38 @@ const handleApiResponse = (
  */
 export const generateImageFromText = async (userPrompt: string): Promise<string> => {
     console.log(`Starting text-to-image generation: ${userPrompt}`);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
 
-    const response = await ai.models.generateImages({
-        model: 'imagen-4.0-generate-001',
-        prompt: userPrompt,
-        config: {
-          numberOfImages: 1,
-          outputMimeType: 'image/png', // Using PNG is better for generated assets
-        },
-    });
+        const response = await ai.models.generateImages({
+            model: 'imagen-4.0-generate-001',
+            prompt: userPrompt,
+            config: {
+              numberOfImages: 1,
+              outputMimeType: 'image/png', // Using PNG is better for generated assets
+            },
+        });
 
-    console.log('Received response from model for text-to-image.', response);
-    
-    if (!response.generatedImages || response.generatedImages.length === 0) {
-        // Fix: The `generateImages` response does not have a `promptFeedback` property.
-        // We provide a generic error message if no images are returned.
-        const errorMessage = `Image generation failed. The model did not return an image. This can happen due to safety filters or an issue with the prompt.`;
-        console.error(errorMessage, { response });
-        throw new Error(errorMessage);
+        console.log('Received response from model for text-to-image.', response);
+        
+        if (!response.generatedImages || response.generatedImages.length === 0) {
+            const errorMessage = `Image generation failed. The model did not return an image. This can happen due to safety filters or an issue with the prompt.`;
+            console.error(errorMessage, { response });
+            throw new Error(errorMessage);
+        }
+        
+        const base64ImageBytes: string = response.generatedImages[0].image.imageBytes;
+        return `data:image/png;base64,${base64ImageBytes}`;
+    } catch (googleError) {
+        console.warn(`Google API (generateImages) failed: ${googleError instanceof Error ? googleError.message : String(googleError)}. Trying Fal AI fallback.`);
+        try {
+            return await falTextToImageFallback(userPrompt);
+        } catch (falError) {
+            console.error(`Fal AI text-to-image fallback also failed: ${falError instanceof Error ? falError.message : String(falError)}`);
+            if (googleError instanceof Error) throw googleError;
+            throw new Error('The AI image generation failed with both primary and fallback services.');
+        }
     }
-    
-    const base64ImageBytes: string = response.generatedImages[0].image.imageBytes;
-    return `data:image/png;base64,${base64ImageBytes}`;
 };
 
 
@@ -128,11 +215,12 @@ export const generateEditedImage = async (
     userPrompt: string,
     hotspot: { x: number, y: number }
 ): Promise<string> => {
-    console.log('Starting generative edit at:', hotspot);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-    
-    const originalImagePart = await fileToPart(originalImage);
-    const prompt = `You are an expert photo editor AI. Your task is to perform a natural, localized edit on the provided image based on the user's request.
+    try {
+        console.log('Starting generative edit at:', hotspot);
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+        
+        const originalImagePart = await fileToPart(originalImage);
+        const prompt = `You are an expert photo editor AI. Your task is to perform a natural, localized edit on the provided image based on the user's request.
 User Request: "${userPrompt}"
 Edit Location: Focus on the area around pixel coordinates (x: ${hotspot.x}, y: ${hotspot.y}).
 
@@ -145,19 +233,30 @@ Safety & Ethics Policy:
 - You MUST REFUSE any request to change a person's fundamental race or ethnicity (e.g., 'make me look Asian', 'change this person to be Black'). Do not perform these edits. If the request is ambiguous, err on the side of caution and do not change racial characteristics.
 
 Output: Return ONLY the final edited image. Do not return text.`;
-    const textPart = { text: prompt };
+        const textPart = { text: prompt };
 
-    console.log('Sending image and prompt to the model...');
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
-        config: {
-            responseModalities: [Modality.IMAGE, Modality.TEXT],
-        },
-    });
-    console.log('Received response from model.', response);
+        console.log('Sending image and prompt to the model...');
+        const response: GenerateContentResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image-preview',
+            contents: { parts: [originalImagePart, textPart] },
+            config: {
+                responseModalities: [Modality.IMAGE, Modality.TEXT],
+            },
+        });
+        console.log('Received response from model.', response);
 
-    return handleApiResponse(response, 'edit');
+        return handleApiResponse(response, 'edit');
+    } catch (googleError) {
+        console.warn(`Google API (edit) failed: ${googleError instanceof Error ? googleError.message : String(googleError)}. Trying Fal AI fallback.`);
+        try {
+            // Note: hotspot info is lost in fallback. The prompt is just the user's text.
+            return await falImageEditFallback(userPrompt, [originalImage], 'edit');
+        } catch (falError) {
+            console.error(`Fal AI edit fallback also failed: ${falError instanceof Error ? falError.message : String(falError)}`);
+            if (googleError instanceof Error) throw googleError;
+            throw new Error('The AI edit operation failed with both primary and fallback services.');
+        }
+    }
 };
 
 /**
@@ -170,11 +269,12 @@ export const generateStylizedImage = async (
     originalImage: File,
     stylizePrompt: string,
 ): Promise<string> => {
-    console.log(`Starting style generation: ${stylizePrompt}`);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-    
-    const originalImagePart = await fileToPart(originalImage);
-    const prompt = `You are an expert photo editor AI. Your task is to apply a stylistic filter or a global adjustment to the entire image based on the user's request. Do not change the composition or content, only apply the style.
+    try {
+        console.log(`Starting style generation: ${stylizePrompt}`);
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+        
+        const originalImagePart = await fileToPart(originalImage);
+        const prompt = `You are an expert photo editor AI. Your task is to apply a stylistic filter or a global adjustment to the entire image based on the user's request. Do not change the composition or content, only apply the style.
 Request: "${stylizePrompt}"
 
 Safety & Ethics Policy:
@@ -182,19 +282,29 @@ Safety & Ethics Policy:
 - You MUST REFUSE any request that explicitly asks to change a person's race (e.g., 'apply a filter to make me look Chinese').
 
 Output: Return ONLY the final filtered image. Do not return text.`;
-    const textPart = { text: prompt };
+        const textPart = { text: prompt };
 
-    console.log('Sending image and style prompt to the model...');
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
-        config: {
-            responseModalities: [Modality.IMAGE, Modality.TEXT],
-        },
-    });
-    console.log('Received response from model for style.', response);
-    
-    return handleApiResponse(response, 'stylize');
+        console.log('Sending image and style prompt to the model...');
+        const response: GenerateContentResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image-preview',
+            contents: { parts: [originalImagePart, textPart] },
+            config: {
+                responseModalities: [Modality.IMAGE, Modality.TEXT],
+            },
+        });
+        console.log('Received response from model for style.', response);
+        
+        return handleApiResponse(response, 'stylize');
+    } catch (googleError) {
+        console.warn(`Google API (stylize) failed: ${googleError instanceof Error ? googleError.message : String(googleError)}. Trying Fal AI fallback.`);
+        try {
+            return await falImageEditFallback(stylizePrompt, [originalImage], 'stylize');
+        } catch (falError) {
+            console.error(`Fal AI stylize fallback also failed: ${falError instanceof Error ? falError.message : String(falError)}`);
+            if (googleError instanceof Error) throw googleError;
+            throw new Error('The AI stylize operation failed with both primary and fallback services.');
+        }
+    }
 };
 
 /**
@@ -207,11 +317,12 @@ export const generateExpandedImage = async (
     imageWithTransparency: File,
     expandPrompt: string
 ): Promise<string> => {
-    console.log(`Starting generative expand with prompt: ${expandPrompt}`);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-    
-    const imagePart = await fileToPart(imageWithTransparency);
-    const prompt = `You are an expert photo editor AI performing an 'outpainting' or 'generative expand' task.
+    try {
+        console.log(`Starting generative expand with prompt: ${expandPrompt}`);
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+        
+        const imagePart = await fileToPart(imageWithTransparency);
+        const prompt = `You are an expert photo editor AI performing an 'outpainting' or 'generative expand' task.
 The user has provided an image that has been placed on a larger, transparent canvas.
 Your task is to fill in the transparent areas ONLY.
 The original, non-transparent part of the image MUST be preserved perfectly and remain completely unchanged.
@@ -219,19 +330,30 @@ Fill the transparent space based on this user request: "${expandPrompt}"
 The new content must blend seamlessly with the original image's edges, matching the style, lighting, and perspective.
 
 Output: Return ONLY the final, filled-in image. Do not include any text.`;
-    const textPart = { text: prompt };
+        const textPart = { text: prompt };
 
-    console.log('Sending image and expand prompt to the model...');
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [imagePart, textPart] },
-        config: {
-            responseModalities: [Modality.IMAGE, Modality.TEXT],
-        },
-    });
-    console.log('Received response from model for expansion.', response);
-    
-    return handleApiResponse(response, 'expand');
+        console.log('Sending image and expand prompt to the model...');
+        const response: GenerateContentResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image-preview',
+            contents: { parts: [imagePart, textPart] },
+            config: {
+                responseModalities: [Modality.IMAGE, Modality.TEXT],
+            },
+        });
+        console.log('Received response from model for expansion.', response);
+        
+        return handleApiResponse(response, 'expand');
+    } catch (googleError) {
+        console.warn(`Google API (expand) failed: ${googleError instanceof Error ? googleError.message : String(googleError)}. Trying Fal AI fallback.`);
+        try {
+            const falPrompt = `Outpaint and fill the transparent areas of the image based on this description: "${expandPrompt}". The original image content must be preserved.`;
+            return await falImageEditFallback(falPrompt, [imageWithTransparency], 'expand');
+        } catch (falError) {
+            console.error(`Fal AI expand fallback also failed: ${falError instanceof Error ? falError.message : String(falError)}`);
+            if (googleError instanceof Error) throw googleError;
+            throw new Error('The AI expand operation failed with both primary and fallback services.');
+        }
+    }
 };
 
 
@@ -241,25 +363,37 @@ Output: Return ONLY the final, filled-in image. Do not include any text.`;
  * @returns A promise that resolves to the data URL of the image with the background removed.
  */
 export const generateRemovedBgImage = async (originalImage: File): Promise<string> => {
-    console.log(`Starting background removal.`);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-    
-    const originalImagePart = await fileToPart(originalImage);
-    const prompt = `You are an expert photo editor AI. Your task is to remove the background from this image, leaving only the main subject. The final output MUST have a transparent background.
+    try {
+        console.log(`Starting background removal.`);
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+        
+        const originalImagePart = await fileToPart(originalImage);
+        const prompt = `You are an expert photo editor AI. Your task is to remove the background from this image, leaving only the main subject. The final output MUST have a transparent background.
 Output ONLY the resulting image. Do not return text.`;
-    const textPart = { text: prompt };
+        const textPart = { text: prompt };
 
-    console.log('Sending image and remove BG prompt to the model...');
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
-        config: {
-            responseModalities: [Modality.IMAGE, Modality.TEXT],
-        },
-    });
-    console.log('Received response from model for remove bg.', response);
-    
-    return handleApiResponse(response, 'remove-bg');
+        console.log('Sending image and remove BG prompt to the model...');
+        const response: GenerateContentResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image-preview',
+            contents: { parts: [originalImagePart, textPart] },
+            config: {
+                responseModalities: [Modality.IMAGE, Modality.TEXT],
+            },
+        });
+        console.log('Received response from model for remove bg.', response);
+        
+        return handleApiResponse(response, 'remove-bg');
+    } catch (googleError) {
+        console.warn(`Google API (remove-bg) failed: ${googleError instanceof Error ? googleError.message : String(googleError)}. Trying Fal AI fallback.`);
+        try {
+            const falPrompt = "Remove the background from this image, leaving only the main subject. The final output MUST have a transparent background.";
+            return await falImageEditFallback(falPrompt, [originalImage], 'remove-bg');
+        } catch (falError) {
+            console.error(`Fal AI remove-bg fallback also failed: ${falError instanceof Error ? falError.message : String(falError)}`);
+            if (googleError instanceof Error) throw googleError;
+            throw new Error('The AI background removal failed with both primary and fallback services.');
+        }
+    }
 };
 
 
@@ -309,27 +443,39 @@ export const generateSceneImage = async (
     originalImage: File,
     scenePrompt: string
 ): Promise<string> => {
-    console.log(`Starting scene generation: ${scenePrompt}`);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    try {
+        console.log(`Starting scene generation: ${scenePrompt}`);
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
 
-    const originalImagePart = await fileToPart(originalImage);
-    const prompt = `You are an expert photo editor AI. Your task is to realistically composite the main subject from the provided image into a completely new scene, as described by the user.
+        const originalImagePart = await fileToPart(originalImage);
+        const prompt = `You are an expert photo editor AI. Your task is to realistically composite the main subject from the provided image into a completely new scene, as described by the user.
 The original subject must be seamlessly integrated into the new background, matching lighting and perspective.
 User's Scene Request: "${scenePrompt}"
 Output ONLY the final composited image. Do not return text.`;
-    const textPart = { text: prompt };
+        const textPart = { text: prompt };
 
-    console.log('Sending image and scene prompt to the model...');
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
-        config: {
-            responseModalities: [Modality.IMAGE, Modality.TEXT],
-        },
-    });
-    console.log('Received response from model for scene.', response);
+        console.log('Sending image and scene prompt to the model...');
+        const response: GenerateContentResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image-preview',
+            contents: { parts: [originalImagePart, textPart] },
+            config: {
+                responseModalities: [Modality.IMAGE, Modality.TEXT],
+            },
+        });
+        console.log('Received response from model for scene.', response);
 
-    return handleApiResponse(response, 'scene');
+        return handleApiResponse(response, 'scene');
+    } catch (googleError) {
+        console.warn(`Google API (scene) failed: ${googleError instanceof Error ? googleError.message : String(googleError)}. Trying Fal AI fallback.`);
+        try {
+            const falPrompt = `Realistically composite the main subject from the provided image into a completely new scene, as described here: "${scenePrompt}"`;
+            return await falImageEditFallback(falPrompt, [originalImage], 'scene');
+        } catch (falError) {
+            console.error(`Fal AI scene fallback also failed: ${falError instanceof Error ? falError.message : String(falError)}`);
+            if (googleError instanceof Error) throw googleError;
+            throw new Error('The AI scene generation failed with both primary and fallback services.');
+        }
+    }
 };
 
 /**
@@ -338,17 +484,18 @@ Output ONLY the final composited image. Do not return text.`;
  * @returns A promise that resolves to the data URL of the upscaled image.
  */
 export const generateUpscaledImage = async (originalImage: File): Promise<string> => {
-    console.log('Starting image upscaling...');
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    try {
+        console.log('Starting image upscaling...');
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
 
-    const { width, height } = await getImageDimensions(originalImage);
-    const targetWidth = width * 2;
-    const targetHeight = height * 2;
-    console.log(`Upscaling from ${width}x${height} to ${targetWidth}x${targetHeight}`);
+        const { width, height } = await getImageDimensions(originalImage);
+        const targetWidth = width * 2;
+        const targetHeight = height * 2;
+        console.log(`Upscaling from ${width}x${height} to ${targetWidth}x${targetHeight}`);
 
 
-    const originalImagePart = await fileToPart(originalImage);
-    const prompt = `You are an expert photo restoration and super-resolution AI.
+        const originalImagePart = await fileToPart(originalImage);
+        const prompt = `You are an expert photo restoration and super-resolution AI.
 Your task is to take the provided image and upscale it to double its original resolution, significantly enhancing details and clarity without altering the content or composition.
 
 The original image is ${width}x${height} pixels.
@@ -360,19 +507,30 @@ Instructions:
 3.  **Output Image Only:** Your final output must be ONLY the upscaled image file. Do not output any text or explanations.
 
 Execute this technical enhancement task.`;
-    const textPart = { text: prompt };
+        const textPart = { text: prompt };
 
-    console.log('Sending image and super-resolution prompt to the model...');
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
-        config: {
-            responseModalities: [Modality.IMAGE, Modality.TEXT],
-        },
-    });
-    console.log('Received response from model for upscale.', response);
+        console.log('Sending image and super-resolution prompt to the model...');
+        const response: GenerateContentResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image-preview',
+            contents: { parts: [originalImagePart, textPart] },
+            config: {
+                responseModalities: [Modality.IMAGE, Modality.TEXT],
+            },
+        });
+        console.log('Received response from model for upscale.', response);
 
-    return handleApiResponse(response, 'upscale');
+        return handleApiResponse(response, 'upscale');
+    } catch (googleError) {
+        console.warn(`Google API (upscale) failed: ${googleError instanceof Error ? googleError.message : String(googleError)}. Trying Fal AI fallback.`);
+        try {
+            const falPrompt = `Upscale this image to double its resolution, enhancing details and clarity without altering the content.`;
+            return await falImageEditFallback(falPrompt, [originalImage], 'upscale');
+        } catch (falError) {
+            console.error(`Fal AI upscale fallback also failed: ${falError instanceof Error ? falError.message : String(falError)}`);
+            if (googleError instanceof Error) throw googleError;
+            throw new Error('The AI upscale operation failed with both primary and fallback services.');
+        }
+    }
 };
 
 /**
@@ -387,22 +545,33 @@ export const generateCompositedImage = async (
     image2: File,
     userPrompt: string
 ): Promise<string> => {
-    console.log(`Starting multi-image composition: ${userPrompt}`);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-    
-    const imagePart1 = await fileToPart(image1);
-    const imagePart2 = await fileToPart(image2);
-    const textPart = { text: userPrompt };
+    try {
+        console.log(`Starting multi-image composition: ${userPrompt}`);
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+        
+        const imagePart1 = await fileToPart(image1);
+        const imagePart2 = await fileToPart(image2);
+        const textPart = { text: userPrompt };
 
-    console.log('Sending multiple images and prompt to the model...');
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [textPart, imagePart1, imagePart2] },
-        config: {
-            responseModalities: [Modality.IMAGE, Modality.TEXT],
-        },
-    });
-    console.log('Received response from model for composition.', response);
-    
-    return handleApiResponse(response, 'compose');
+        console.log('Sending multiple images and prompt to the model...');
+        const response: GenerateContentResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image-preview',
+            contents: { parts: [textPart, imagePart1, imagePart2] },
+            config: {
+                responseModalities: [Modality.IMAGE, Modality.TEXT],
+            },
+        });
+        console.log('Received response from model for composition.', response);
+        
+        return handleApiResponse(response, 'compose');
+    } catch (googleError) {
+        console.warn(`Google API (compose) failed: ${googleError instanceof Error ? googleError.message : String(googleError)}. Trying Fal AI fallback.`);
+        try {
+            return await falImageEditFallback(userPrompt, [image1, image2], 'compose');
+        } catch (falError) {
+            console.error(`Fal AI compose fallback also failed: ${falError instanceof Error ? falError.message : String(falError)}`);
+            if (googleError instanceof Error) throw googleError;
+            throw new Error('The AI compose operation failed with both primary and fallback services.');
+        }
+    }
 };
